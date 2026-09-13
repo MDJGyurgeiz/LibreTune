@@ -190,16 +190,27 @@ pub fn read_ltlog_schema<P: AsRef<Path>>(path: P) -> io::Result<LtlogSchema> {
 
 /// Visit every sample without accumulating the log. RAM is one compressed
 /// block (~128 rows) plus whatever the callback keeps.
-pub fn visit_ltlog<P, F>(path: P, mut visit: F) -> io::Result<LtlogSchema>
+pub fn visit_ltlog<P, F>(path: P, visit: F) -> io::Result<LtlogSchema>
 where
     P: AsRef<Path>,
     F: FnMut(&LogEntry) -> io::Result<()>,
 {
     let mut r = BufReader::new(File::open(path)?);
-    let schema = read_header(&mut r)?;
+    visit_reader(&mut r, visit)
+}
+
+/// Block loop behind [`visit_ltlog`], on an already-open reader at offset 0.
+/// Split out so tests can drive it with odd buffer sizes and short-read
+/// adapters — the sync scan between blocks is where reads get short.
+fn visit_reader<R, F>(r: &mut R, mut visit: F) -> io::Result<LtlogSchema>
+where
+    R: Read + Seek,
+    F: FnMut(&LogEntry) -> io::Result<()>,
+{
+    let schema = read_header(r)?;
     let n_channels = schema.channels.len();
     loop {
-        match read_next_block(&mut r, n_channels) {
+        match read_next_block(r, n_channels) {
             Ok(Some(block)) => {
                 for e in &block {
                     visit(e)?;
@@ -496,11 +507,19 @@ enum SyncFound {
 }
 
 fn find_sync<R: Read>(r: &mut R, block: &[u8; 4], footer: &[u8; 4]) -> io::Result<SyncFound> {
+    // `read_exact`, not `read`: a single `read` may return 1–3 bytes without
+    // being anywhere near the end of the file — `BufReader` hands back
+    // whatever is left in its buffer before refilling. Treating that short
+    // read as EOF silently dropped every block after the first buffer
+    // boundary that fell 1–3 bytes before a sync mark. Only a genuine
+    // `UnexpectedEof` means the file is over.
     let mut window = [0u8; 4];
-    match r.read(&mut window)? {
-        0 => return Ok(SyncFound::Eof),
-        1..=3 => return Ok(SyncFound::Eof),
-        _ => {}
+    if let Err(e) = r.read_exact(&mut window) {
+        return if e.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(SyncFound::Eof)
+        } else {
+            Err(e)
+        };
     }
     loop {
         if &window == block {
@@ -511,9 +530,10 @@ fn find_sync<R: Read>(r: &mut R, block: &[u8; 4], footer: &[u8; 4]) -> io::Resul
         }
         window.copy_within(1.., 0);
         let mut b = [0u8; 1];
-        match r.read(&mut b)? {
-            0 => return Ok(SyncFound::Eof),
-            _ => window[3] = b[0],
+        match r.read_exact(&mut b) {
+            Ok(()) => window[3] = b[0],
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(SyncFound::Eof),
+            Err(e) => return Err(e),
         }
     }
 }
@@ -736,5 +756,83 @@ mod tests {
         assert_eq!(time.len(), 2);
         assert_eq!(cols[0], vec![40.0, 55.0]);
         assert!(cols[1].is_empty());
+    }
+
+    /// `Read` adapter that never hands back more than `max` bytes per call.
+    /// Models the short read a `BufReader` produces at a buffer boundary,
+    /// but on every call, so the outcome does not depend on where block
+    /// offsets happen to fall in this particular file.
+    struct ShortReads<R> {
+        inner: R,
+        max: usize,
+    }
+
+    impl<R: Read> Read for ShortReads<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.max);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    impl<R: Seek> Seek for ShortReads<R> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// 300 samples = two full 128-sample blocks plus a 44-sample tail, so the
+    /// reader has to locate a sync mark mid-file twice, not just once.
+    fn three_block_log(dir: &Path) -> (std::path::PathBuf, usize) {
+        let path = dir.join("blocks.ltlog");
+        let n = 300;
+        let entries: Vec<_> = (0..n)
+            .map(|i| sample(i as u64 * 20, vec![i as f64]))
+            .collect();
+        write_ltlog(&path, &schema(&["rpm"]), &entries).unwrap();
+        (path, n)
+    }
+
+    #[test]
+    fn short_reads_between_blocks_do_not_truncate_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, n) = three_block_log(dir.path());
+        let bytes = std::fs::read(&path).unwrap();
+        // 3 bytes per read: every 4-byte sync window comes back short on its
+        // first call, which the scanner used to mistake for end-of-file.
+        // Header and block payloads already went through `read_exact`, so
+        // only the sync scan between blocks was ever exposed to this.
+        let mut r = ShortReads {
+            inner: io::Cursor::new(bytes),
+            max: 3,
+        };
+        let mut count = 0usize;
+        visit_reader(&mut r, |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, n, "a short read is not end-of-file");
+    }
+
+    #[test]
+    fn every_bufreader_capacity_reads_every_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, n) = three_block_log(dir.path());
+        // The real-world trigger: `BufReader::read` returns whatever is left
+        // in its buffer before refilling, so a block starting 1–3 bytes
+        // before a boundary yielded a 1–3 byte read and the scan gave up,
+        // silently dropping the rest of the log. Sweeping the capacity walks
+        // the boundary across every offset of this file rather than guessing
+        // the one that bites the default 8 KiB buffer on a multi-hour log.
+        for cap in 1..=1024usize {
+            let mut r = BufReader::with_capacity(cap, File::open(&path).unwrap());
+            let mut count = 0usize;
+            visit_reader(&mut r, |_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(count, n, "BufReader capacity {cap} lost samples");
+        }
     }
 }
